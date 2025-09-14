@@ -14,5 +14,7 @@ Gere apenas um único SQL SELECT, sem explicações, obedecendo às regras:
 - Evite funções ou features não suportadas pela versão MySQL padrão.
 - Para ordenações customizadas (ex.: maior prioridade), use FIELD(...) ou CASE respeitando os valores reais.
 - Se precisar identificar registros por nome informado na pergunta, filtre por LIKE '%valor%'.
+- Todo alias de coluna deve ser um identificador simples (sem vírgulas) e cada expressão no SELECT deve ser válida no MySQL.
+- Se usar agregações (SUM/COUNT/etc.), inclua as colunas não agregadas no GROUP BY conforme necessário pelo MySQL.
 - Não inclua markdown (```), nem comentários; retorne apenas o SQL executável.
 """

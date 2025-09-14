@@ -4,6 +4,7 @@ from app.ai.sql_generator import SQLGenerator
 from app.db_external.connection import get_external_connection
 import os
 import json
+import logging
 
 class ChatPipeline:
 
@@ -33,7 +34,11 @@ class ChatPipeline:
                 cursor.execute(sql_clean)
                 result = cursor.fetchall()
         except Exception as e:
-            clarification = f"Sua pergunta não foi clara ou não foi possível gerar um SQL válido. Pode reformular ou dar mais detalhes? Erro: {str(e)}"
+            logging.getLogger(__name__).exception("Falha ao executar SQL gerado")
+            clarification = (
+                "Sua pergunta não foi clara ou não foi possível gerar uma consulta válida. "
+                "Você pode reformular ou dar mais detalhes?"
+            )
             return clarification, sql_clean, None, clarification
         finally:
             try:
@@ -76,7 +81,10 @@ class ChatPipeline:
                     cursor.execute(fuzzy_sql_clean)
                     fuzzy_result = cursor.fetchall()
             except Exception as e:
-                clarification = f"Nenhum resultado encontrado e não foi possível buscar por aproximação. Erro: {str(e)}"
+                logging.getLogger(__name__).exception("Falha ao executar SQL de busca aproximada")
+                clarification = (
+                    "Nenhum resultado encontrado e não foi possível realizar uma busca por aproximação no momento."
+                )
                 return clarification, fuzzy_sql_clean, None, clarification
             finally:
                 try:

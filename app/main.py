@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
+import logging
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from . import schemas, crud
@@ -61,7 +62,8 @@ def ask_question(question: schemas.Question, auth: bool = Depends(verify_token),
         pipeline = ChatPipeline()
         answer, sql, result, clarification = pipeline.ask(question.question, history_msgs)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.getLogger(__name__).exception("Erro inesperado no endpoint /ask")
+        raise HTTPException(status_code=500, detail="Não foi possível processar sua solicitação no momento.")
     # Salva histórico da pergunta e resposta final
     history = crud.create_history(db, question=question.question, answer=answer, session_id=session.id)
     return {
