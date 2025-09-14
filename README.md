@@ -27,7 +27,7 @@ Copy-Item .env.example .env
 # Edit .env and set at minimum:
 # - OPENAI_API_KEY
 # - ASK_BEARER_TOKEN (a secure random value)
-# Optional: EXT_MYSQL_* to point to an external MySQL database
+# - EXT_MYSQL_* to point to an external MySQL database
 ```
 
 2. Start services
@@ -89,11 +89,11 @@ Internal database (docker-compose):
 
 - `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DB`, `MYSQL_HOST`.
 
-External database (optional):
+External database to connect:
 
 - `EXT_MYSQL_HOST`, `EXT_MYSQL_PORT`, `EXT_MYSQL_USER`, `EXT_MYSQL_PASSWORD`, `EXT_MYSQL_DB`.
 
-OpenAI (optional):
+OpenAI:
 
 - `OPENAI_MODEL` (e.g., `gpt-5-mini`), `OPENAI_TEMPERATURE`, `OPENAI_MAX_TOKENS`.
 
