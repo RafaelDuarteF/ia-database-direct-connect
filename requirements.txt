@@ -2,6 +2,9 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 pymysql
+psycopg2-binary
+pyodbc
+oracledb
 openai
 python-dotenv
 alembic

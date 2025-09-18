@@ -1,112 +1,201 @@
-import pymysql
-from .connection import get_external_connection
+from typing import Dict, Iterable, Optional, Set
 
-import json
-def get_db_schema(tables_and_columns: dict = None) -> str:
+from sqlalchemy import inspect, MetaData, Table, select, func, text
+from sqlalchemy.engine import Engine
+from .connection import get_sqlalchemy_engine
+
+
+def _build_sqlalchemy_engine() -> Engine:
+    # Reusa o helper centralizado no módulo de conexão
+    return get_sqlalchemy_engine()
+
+
+def _default_schema_for_dialect(dialect_name: str, inspector) -> Optional[str]:
+    """Resolve o schema default por SGBD, usando o inspector quando possível."""
+    try:
+        # Disponível em várias engines
+        default_from_inspector = getattr(inspector, "default_schema_name", None)
+        if default_from_inspector:
+            return default_from_inspector
+    except Exception:
+        pass
+    if dialect_name == "postgresql":
+        return "public"
+    if dialect_name == "mssql":
+        return "dbo"
+    # MySQL não usa schema separado do database; Oracle usa o usuário atual
+    return None
+
+
+def get_db_schema(tables_and_columns: Dict[str, Optional[Iterable[str]]] | None = None) -> str:
     """
-    Retorna o schema (SHOW TABLES, DESCRIBE, exemplos e FKs) do banco externo como string formatada.
+    Retorna o schema (tabelas, colunas, PK, índices/uniques, FKs, contagem e exemplos) do banco externo como string.
+
     tables_and_columns: dict opcional no formato {"tabela1": ["col1", "col2"], "tabela2": None, ...}
     Se None, pega todas as tabelas e colunas.
     """
-    conn = get_external_connection()
+    # Tenta criar engine e inspector; se falhar, retorna mensagem amigável para não derrubar o app
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SHOW TABLES;")
-            all_tables = [row[list(row.keys())[0]] for row in cursor.fetchall()]
-            # Se não passar filtro, pega todas
-            if tables_and_columns is None:
-                tables = all_tables
-            else:
-                tables = [t for t in all_tables if t in tables_and_columns]
-            schema = []
-            all_fks = []
+        engine = _build_sqlalchemy_engine()
+        insp = inspect(engine)
+    except Exception as e:
+        return f"Schema indisponível no momento (erro de conexão/reflection): {e}"
+    dialect = engine.dialect.name  # 'mysql', 'postgresql', 'oracle', 'mssql'
+    target_schema = _default_schema_for_dialect(dialect, insp)
+
+    # Lista de tabelas disponíveis no schema alvo
+    try:
+        tables_all = insp.get_table_names(schema=target_schema)
+    except Exception as e:
+        return f"Schema indisponível (falha ao listar tabelas): {e}"
+    if tables_and_columns is None:
+        tables = tables_all
+    else:
+        tables = [t for t in tables_all if t in tables_and_columns]
+
+    # Normaliza filtro de colunas
+    def allowed_for(table_name: str) -> Optional[Set[str]]:
+        if tables_and_columns is None:
+            return None
+        if table_name not in tables_and_columns:
+            return None
+        cols = tables_and_columns[table_name]
+        if not cols:  # None ou [] => todas
+            return None
+        return set(cols)
+
+    lines: list[str] = []
+    all_fks_global: list[tuple[str, str, str, str]] = []
+
+    metadata = MetaData()
+    try:
+        with engine.connect() as conn:
             for table in tables:
-                cursor.execute(f"DESCRIBE {table};")
-                columns = cursor.fetchall()
-                # Filtra colunas se necessário
-                allowed_cols = None
-                if tables_and_columns is not None and table in tables_and_columns:
-                    # None ou [] significa todas as colunas
-                    if tables_and_columns[table] is None:
-                        allowed_cols = None
-                    else:
-                        allowed_cols = set(tables_and_columns[table])
-                schema.append(f"Tabela: {table}")
+                lines.append(f"Tabela: {table}")
+
+                # Carrega metadados da tabela
+                try:
+                    tbl_obj = Table(table, metadata, schema=target_schema, autoload_with=engine)
+                except Exception:
+                    tbl_obj = None
+
                 # Contagem de registros
                 try:
-                    cursor.execute(f"SELECT COUNT(*) as count FROM {table};")
-                    count = cursor.fetchone()['count']
-                    schema.append(f"  Total de registros: {count}")
+                    if tbl_obj is not None:
+                        count_val = conn.execute(select(func.count()).select_from(tbl_obj)).scalar_one()
+                    else:
+                        # Fallback simples
+                        fq_name = f"{target_schema}.{table}" if target_schema else table
+                        count_val = conn.execute(select(func.count()).select_from(text(fq_name))).scalar()
+                    lines.append(f"  Total de registros: {count_val}")
                 except Exception:
                     pass
+
                 # Chave primária
-                pk_cols = [col['Field'] for col in columns if col['Key'] == 'PRI']
-                if pk_cols:
-                    schema.append(f"  Primary Key: {', '.join(pk_cols)}")
-                # Uniques e Indexes
                 try:
-                    cursor.execute(f"SHOW INDEX FROM {table};")
-                    indexes = cursor.fetchall()
-                    unique_indexes = set()
-                    normal_indexes = set()
-                    for idx in indexes:
-                        if idx['Non_unique'] == 0:
-                            unique_indexes.add(idx['Column_name'])
-                        else:
-                            normal_indexes.add(idx['Column_name'])
-                    if unique_indexes:
-                        schema.append(f"  Unique: {', '.join(sorted(unique_indexes))}")
-                    if normal_indexes:
-                        schema.append(f"  Indexes: {', '.join(sorted(normal_indexes))}")
+                    pk_info = insp.get_pk_constraint(table, schema=target_schema) or {}
+                    pk_cols = pk_info.get("constrained_columns") or []
+                    if pk_cols:
+                        lines.append(f"  Primary Key: {', '.join(pk_cols)}")
                 except Exception:
                     pass
+
+                # Uniques e Indexes
+                unique_cols: Set[str] = set()
+                normal_idx_cols: Set[str] = set()
+                try:
+                    for uc in insp.get_unique_constraints(table, schema=target_schema) or []:
+                        for c in uc.get("column_names") or []:
+                            unique_cols.add(c)
+                except Exception:
+                    pass
+                try:
+                    for idx in insp.get_indexes(table, schema=target_schema) or []:
+                        cols = idx.get("column_names") or []
+                        if idx.get("unique"):
+                            unique_cols.update(cols)
+                        else:
+                            normal_idx_cols.update(cols)
+                except Exception:
+                    pass
+                if unique_cols:
+                    lines.append(f"  Unique: {', '.join(sorted(unique_cols))}")
+                if normal_idx_cols:
+                    lines.append(f"  Indexes: {', '.join(sorted(normal_idx_cols))}")
+
                 # Colunas detalhadas
-                for col in columns:
-                    if allowed_cols and col['Field'] not in allowed_cols:
-                        continue
-                    details = [f"{col['Field']} {col['Type']}"]
-                    if col.get('Null', '').upper() == 'NO':
-                        details.append("NOT NULL")
-                    if col.get('Default') is not None:
-                        details.append(f"DEFAULT {col['Default']}")
-                    if col['Key'] == 'UNI':
-                        details.append("UNIQUE")
-                    schema.append(f"  Coluna: {' '.join(details)}")
+                try:
+                    cols_info = insp.get_columns(table, schema=target_schema)
+                    allowed_cols = allowed_for(table)
+                    for col in cols_info:
+                        name = col.get("name") or col.get("key")
+                        if allowed_cols and name not in allowed_cols:
+                            continue
+                        coltype = str(col.get("type"))
+                        details = [f"{name} {coltype}"]
+                        if not col.get("nullable", True):
+                            details.append("NOT NULL")
+                        if col.get("default") is not None:
+                            details.append(f"DEFAULT {col['default']}")
+                        if name in unique_cols:
+                            details.append("UNIQUE")
+                        lines.append(f"  Coluna: {' '.join(details)}")
+                except Exception:
+                    pass
+
                 # Foreign keys
-                cursor.execute(f"SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE TABLE_NAME='{table}' AND REFERENCED_TABLE_NAME IS NOT NULL;")
-                fks = cursor.fetchall()
-                if fks:
-                    schema.append(f"  Foreign Keys:")
-                for fk in fks:
-                    if allowed_cols and fk['COLUMN_NAME'] not in allowed_cols:
-                        continue
-                    schema.append(f"    {fk['COLUMN_NAME']} -> {fk['REFERENCED_TABLE_NAME']}.{fk['REFERENCED_COLUMN_NAME']}")
-                    all_fks.append((table, fk['COLUMN_NAME'], fk['REFERENCED_TABLE_NAME'], fk['REFERENCED_COLUMN_NAME']))
+                try:
+                    fks = insp.get_foreign_keys(table, schema=target_schema) or []
+                    allowed_cols = allowed_for(table)
+                    if fks:
+                        lines.append("  Foreign Keys:")
+                    for fk in fks:
+                        cols = fk.get("constrained_columns") or []
+                        ref_t = fk.get("referred_table")
+                        ref_cols = fk.get("referred_columns") or []
+                        for i, c in enumerate(cols):
+                            if allowed_cols and c not in allowed_cols:
+                                continue
+                            ref_c = ref_cols[i] if i < len(ref_cols) else "?"
+                            lines.append(f"    {c} -> {ref_t}.{ref_c}")
+                            all_fks_global.append((table, c, ref_t or "?", ref_c))
+                except Exception:
+                    pass
+
                 # Exemplos reais de dados
                 try:
-                    # Só seleciona as colunas permitidas
-                    if allowed_cols:
-                        col_list = ', '.join([f'`{c}`' for c in allowed_cols])
-                        cursor.execute(f"SELECT {col_list} FROM {table} LIMIT 3;")
-                    else:
-                        cursor.execute(f"SELECT * FROM {table} LIMIT 3;")
-                    rows = cursor.fetchall()
-                    if rows:
-                        schema.append(f"  Exemplos de dados:")
-                        for row in rows:
-                            # Só mostra as colunas permitidas
-                            if allowed_cols:
-                                row_str = ', '.join([f"{k}: {v}" for k, v in row.items() if k in allowed_cols])
-                            else:
-                                row_str = ', '.join([f"{k}: {v}" for k, v in row.items()])
-                            schema.append(f"    {row_str}")
+                    allowed_cols = allowed_for(table)
+                    if tbl_obj is not None:
+                        if allowed_cols:
+                            cols = [tbl_obj.c[c] for c in tbl_obj.c.keys() if c in allowed_cols]
+                            if not cols:  # se filtro não existe nas colunas, pula
+                                cols = list(tbl_obj.c)
+                            stmt = select(*cols).limit(3)
+                        else:
+                            stmt = select(tbl_obj).limit(3)
+                        result = conn.execute(stmt).fetchall()
+                        if result:
+                            lines.append("  Exemplos de dados:")
+                            for row in result:
+                                mapping = getattr(row, "_mapping", None)
+                                if mapping is not None:
+                                    items = mapping.items()
+                                else:
+                                    # Fallback para tuplas sem nomes
+                                    items = list(zip([c.key for c in (cols if allowed_cols else tbl_obj.c)], row))
+                                if allowed_cols:
+                                    items = [(k, v) for k, v in items if k in allowed_cols]
+                                row_str = ", ".join([f"{k}: {v}" for k, v in items])
+                                lines.append(f"    {row_str}")
                 except Exception:
                     pass
-            # Bloco global de relações
-            if all_fks:
-                schema.append("\nRelações entre tabelas:")
-                for t, col, ref_t, ref_col in all_fks:
-                    schema.append(f"  {t}.{col} -> {ref_t}.{ref_col}")
-            return '\n'.join(schema)
-    finally:
-        conn.close()
+
+    except Exception as e:
+        lines.append(f"\nObservação: introspecção interrompida por erro de conexão/consulta: {e}")
+
+    if all_fks_global:
+        lines.append("\nRelações entre tabelas:")
+        for t, col, ref_t, ref_col in all_fks_global:
+            lines.append(f"  {t}.{col} -> {ref_t}.{ref_col}")
+
+    return "\n".join(lines)
